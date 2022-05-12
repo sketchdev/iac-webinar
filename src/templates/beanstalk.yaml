@@ -1,0 +1,403 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Template to create an Elastic Beanstalk instance for the API hosting
+
+Parameters:
+  StageId:
+    Description: Environment Designation (development, staging, production, etc.)
+    Type: String
+    Default: Development
+
+  StageIdLowercase:
+    Description: Environment Designation (development, staging, production, etc.)
+    Type: String
+    Default: development
+
+  Client:
+    Description: Name of the client the stack is being created for
+    Type: String
+
+  PlatformDomain:
+    Description: DNS-compliant domain name for the application Platform
+    Type: String
+
+  PlatformName:
+    Description: DNS-compliant name for the Platform
+    Type: String
+
+  PlatformNameLowercase:
+    Description: Lowercase DNS-compliant name for the Platform
+    Type: String
+
+  HostedZoneId:
+    Description: Route53 hosted zone id for the domain hosting the ACM certificate
+    Type: AWS::Route53::HostedZone::Id
+
+  SourceStageIdLowercase:
+    Description: Name of stage that the source database was cloned from (i.e. "QA")
+    Type: String
+
+  AppVersion:
+    Description: Application version label of the code to deploy to this environment (comes from Beanstalk app versions)
+    Type: String
+
+
+Resources:
+  apiSSLCertificate:
+    Type: AWS::CertificateManager::Certificate
+    Properties:
+      DomainName:
+        Fn::Join: [ "", [ !Ref StageIdLowercase, "-api.", !Ref PlatformDomain ] ]
+      DomainValidationOptions:
+        - DomainName:
+            Fn::Join: [ "", [ !Ref StageIdLowercase, "-api.", !Ref PlatformDomain ] ]
+          HostedZoneId:
+            !Ref HostedZoneId
+      ValidationMethod: DNS
+      Tags:
+        - Key: Name
+          Value:
+            !Sub "${StageId} API certificate"
+        - Key: Billing
+          Value: !Ref Client
+        - Key: Client
+          Value: !Ref Client
+        - Key: Purpose
+          Value: Security
+        - Key: Environment
+          Value:
+            !Ref StageId
+
+
+  albSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName:
+        !Sub "${StageId}-API-ALB-Security"
+      GroupDescription: Allow https to API ALB
+      VpcId:
+        Fn::ImportValue:
+          !Sub "${PlatformName}-Vpc-VPCID"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value:
+            !Sub "${StageId}-API-ALB-Security"
+        - Key: Billing
+          Value: !Ref Client
+        - Key: Client
+          Value: !Ref Client
+        - Key: Purpose
+          Value: Security
+        - Key: Environment
+          Value:
+            !Ref StageId
+
+  apiSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName:
+        !Sub "${StageId}-API-Security"
+      GroupDescription: Allow https to API from ALB
+      VpcId:
+        Fn::ImportValue:
+          !Sub "${PlatformName}-Vpc-VPCID"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId:
+            !GetAtt albSecurityGroup.GroupId
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId:
+            !GetAtt albSecurityGroup.GroupId
+      Tags:
+        - Key: Name
+          Value:
+            !Sub "${StageId}-API-Security"
+        - Key: Billing
+          Value: !Ref Client
+        - Key: Client
+          Value: !Ref Client
+        - Key: Purpose
+          Value: Security
+        - Key: Environment
+          Value:
+            !Ref StageId
+
+  dbSecurityGroupIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      Description: DB access from API servers
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      GroupId:
+        Fn::ImportValue:
+          !Sub "${PlatformName}-Rds-${StageId}-RDSSecurityGroup"
+      SourceSecurityGroupId:
+        !Ref apiSecurityGroup
+
+  # Set up a role that each instance running under Beanstalk may assume for accessing S3 buckets
+  # that contain application code and the like
+  beanstalkInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Description:
+        !Sub "Role for ${StageIdLowercase} beanstalk instances"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSElasticBeanstalkWebTier
+      Tags:
+        - Key: Name
+          Value:
+            !Sub "${StageId}-Beanstalk-Instances-Role"
+        - Key: Billing
+          Value: !Ref Client
+        - Key: Client
+          Value: !Ref Client
+        - Key: Purpose
+          Value: Security
+        - Key: Environment
+          Value:
+            !Ref StageId
+
+
+  beanstalkInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /eb/
+      Roles:
+        - !Ref beanstalkInstanceRole
+
+
+  apiBeanstalkEnvironment:
+    Type: AWS::ElasticBeanstalk::Environment
+    Properties:
+      ApplicationName:
+        !Ref PlatformNameLowercase
+      Description:
+        !Sub "AWS Elastic Beanstalk environment for ${StageIdLowercase} api"
+      EnvironmentName:
+        !Sub "${PlatformNameLowercase}-api-${StageIdLowercase}"
+      CNAMEPrefix:
+        Fn::Join: [ "-", [ !Ref StageIdLowercase, !Ref PlatformNameLowercase ] ]
+      # https://docs.aws.amazon.com/elasticbeanstalk/latest/platforms/platforms-supported.html
+      SolutionStackName: "64bit Amazon Linux 2 v5.5.2 running Node.js 14"
+      OptionSettings:
+        # https://docs.aws.amazon.com/elasticbeanstalk/latest/dg/command-options-general.html
+        - Namespace: "aws:ec2:instances"
+          OptionName: InstanceTypes
+          Value: t3a.small
+        - Namespace: "aws:autoscaling:launchconfiguration"
+          OptionName: IamInstanceProfile
+          Value:
+            !Ref beanstalkInstanceProfile
+        - Namespace: "aws:autoscaling:launchconfiguration"
+          OptionName: SecurityGroups
+          Value:
+            !GetAtt apiSecurityGroup.GroupId
+        - Namespace: "aws:autoscaling:updatepolicy:rollingupdate"
+          OptionName: RollingUpdateEnabled
+          Value: true
+        - Namespace: "aws:ec2:vpc"
+          OptionName: VPCId
+          Value:
+            Fn::ImportValue:
+              !Sub "${PlatformName}-Vpc-VPCID"
+        - Namespace: "aws:ec2:vpc"
+          OptionName: ELBSubnets
+          Value:
+            Fn::Join: [ ",", [ Fn::ImportValue: !Sub "${PlatformName}-Vpc-PublicSubnet1ID", Fn::ImportValue: !Sub "${PlatformName}-Vpc-PublicSubnet2ID", Fn::ImportValue: !Sub "${PlatformName}-Vpc-PublicSubnet3ID", Fn::ImportValue: !Sub "${PlatformName}-Vpc-PublicSubnet4ID" ] ]
+        - Namespace: "aws:ec2:vpc"
+          OptionName: Subnets
+          Value:
+            Fn::Join: [ ",", [ Fn::ImportValue: !Sub "${PlatformName}-Vpc-PrivateSubnet1AID", Fn::ImportValue: !Sub "${PlatformName}-Vpc-PrivateSubnet2AID", Fn::ImportValue: !Sub "${PlatformName}-Vpc-PrivateSubnet3AID", Fn::ImportValue: !Sub "${PlatformName}-Vpc-PrivateSubnet4AID" ] ]
+        - Namespace: "aws:ec2:vpc"
+          OptionName: AssociatePublicIpAddress
+          Value: false
+
+        ########################################################
+        ##  Environment Variables for the runtime application
+        ########################################################
+        # System env vars for the beanstalk stack to keep in this CloudFormation setup
+        - Namespace: "aws:elasticbeanstalk:application:environment"
+          OptionName: ENVIRONMENT
+          Value:
+            !Ref StageId
+
+        - Namespace: "aws:elasticbeanstalk:application:environment"
+          OptionName: PG_CONNECTION_STRING
+          Value:
+            Fn::Sub:
+              - "postgresql://${DBUSER}:${DBPASSWORD}@${DBHOST}/${DBNAME}"
+              - DBUSER: !Sub "{{resolve:secretsmanager:${PlatformNameLowercase}-${SourceStageIdLowercase}-db:SecretString:username}}"
+                DBPASSWORD: !Sub "{{resolve:secretsmanager:${PlatformNameLowercase}-${SourceStageIdLowercase}-db:SecretString:password}}"
+                DBHOST:
+                  Fn::ImportValue:
+                    !Sub "${PlatformName}-Rds-${StageId}-RDSEndpoint"
+                DBNAME: !Sub "{{resolve:secretsmanager:${PlatformNameLowercase}-${SourceStageIdLowercase}-db:SecretString:dbname}}"
+
+        - Namespace: "aws:elasticbeanstalk:application:environment"
+          OptionName: PORT
+          Value: 3001
+
+        - Namespace: "aws:elasticbeanstalk:application:environment"
+          OptionName: INVITE_LANDING_URL
+          Value:
+            !Sub "http://${StageIdLowercase}.${PlatformDomain}/accept"
+
+        - Namespace: "aws:elasticbeanstalk:application:environment"
+          OptionName: RECOVERY_LANDING_URL
+          Value:
+            !Sub "http://${StageIdLowercase}.${PlatformDomain}/recover-password"
+
+        - Namespace: "aws:elasticbeanstalk:application:environment"
+          OptionName: ROOT_EMAIL
+          Value: "clifford@sketchdev.io"
+
+        - Namespace: "aws:elasticbeanstalk:application:environment"
+          OptionName: ROOT_FIRST_NAME
+          Value: "Root"
+
+        - Namespace: "aws:elasticbeanstalk:application:environment"
+          OptionName: ROOT_LAST_NAME
+          Value: "User"
+
+        - Namespace: "aws:elasticbeanstalk:application:environment"
+          OptionName: ROOT_PASSWORD
+          Value: "TypeThisForEntry"
+
+        - Namespace: "aws:elasticbeanstalk:application:environment"
+          OptionName: SMTP_HOST
+          Value: "email-smtp.us-east-1.amazonaws.com"
+
+        - Namespace: "aws:elasticbeanstalk:application:environment"
+          OptionName: SMTP_PORT
+          Value: "465"
+
+        - Namespace: "aws:elasticbeanstalk:application:environment"
+          OptionName: SMTP_USER
+          Value:
+            !Sub "{{resolve:secretsmanager:${PlatformNameLowercase}-${SourceStageIdLowercase}-smtp:SecretString:username}}"
+
+        - Namespace: "aws:elasticbeanstalk:application:environment"
+          OptionName: SMTP_PASS
+          Value:
+            !Sub "{{resolve:secretsmanager:${PlatformNameLowercase}-${SourceStageIdLowercase}-smtp:SecretString:password}}"
+
+        - Namespace: "aws:elasticbeanstalk:application:environment"
+          OptionName: HUBSPOT_API_BASE_URL
+          Value: "https://api.hubapi.com"
+        - Namespace: "aws:elasticbeanstalk:application:environment"
+          OptionName: HUBSPOT_APP_BASE_URL
+          Value: "https://app.hubspot.com"
+        - Namespace: "aws:elasticbeanstalk:application:environment"
+          OptionName: HUBSPOT_AUTH_BASE_URL
+          Value: "https://app.hubspot.com/oauth/authorize"
+        - Namespace: "aws:elasticbeanstalk:application:environment"
+          OptionName: HUBSPOT_SCOPES
+          Value: "contacts"
+        ############################################################
+        ##  /END Environment Variables for the runtime application
+        ############################################################
+
+        - Namespace: "aws:elasticbeanstalk:command"
+          OptionName: DeploymentPolicy
+          Value: Rolling
+
+        - Namespace: "aws:elasticbeanstalk:environment"
+          OptionName: LoadBalancerType
+          Value: application
+
+        - Namespace: "aws:elasticbeanstalk:environment"
+          OptionName: ServiceRole
+          Value:
+            !Sub "arn:aws:iam::${AWS::AccountId}:role/aws-elasticbeanstalk-service-role"
+
+        - Namespace: "aws:elasticbeanstalk:environment:process:default"
+          OptionName: HealthCheckPath
+          Value: /
+
+        - Namespace: "aws:elasticbeanstalk:environment:process:default"
+          OptionName: MatcherHTTPCode
+          Value: 401
+
+        - Namespace: "aws:elbv2:loadbalancer"
+          OptionName: SecurityGroups
+          Value:
+            !GetAtt albSecurityGroup.GroupId
+
+        - Namespace: "aws:elasticbeanstalk:cloudwatch:logs"
+          OptionName: RetentionInDays
+          Value: 90
+
+        - Namespace: "aws:elasticbeanstalk:cloudwatch:logs"
+          OptionName: StreamLogs
+          Value: true
+
+        # Enable HTTPS listener on ALB
+        - Namespace: "aws:elbv2:listener:443"
+          OptionName: Protocol
+          Value: HTTPS
+        - Namespace: "aws:elbv2:listener:443"
+          OptionName: SSLCertificateArns
+          Value:
+            !Ref apiSSLCertificate
+      Tier:
+        Name: WebServer
+        Type: Standard
+      VersionLabel: !Ref AppVersion
+      Tags:
+        - Key: Name
+          Value:
+            !Sub "${StageId} API"
+        - Key: Billing
+          Value: !Ref Client
+        - Key: Client
+          Value: !Ref Client
+        - Key: Purpose
+          Value: API-hosting
+        - Key: Environment
+          Value:
+            !Ref StageId
+
+
+  beanstalkDnsCnameEntry:
+    DependsOn:
+      - apiBeanstalkEnvironment
+    Type: AWS::Route53::RecordSet
+    Properties:
+      Name:
+        Fn::Join: [ "", [ !Ref StageIdLowercase, "-api.", !Ref PlatformDomain ] ]
+      AliasTarget:
+        DNSName:
+          Fn::Join: [ "", [ !Ref StageIdLowercase, "-", !Ref PlatformNameLowercase, ".", !Ref "AWS::Region", ".elasticbeanstalk.com" ] ]
+        # HostedZoneId info for beanstalk can be found at https://docs.amazonaws.cn/en_us/general/latest/gr/elasticbeanstalk.html
+        HostedZoneId: Z117KPS5GTRQ2G
+      Comment:
+        !Sub "DNS alias to API ALB for the ${StageId} ${PlatformName} Platform"
+      HostedZoneId:
+        !Ref HostedZoneId
+      Type: A
+
+
+Outputs:
+  ApiSecurityGroupId:
+    Description: ID of the security group tied to the API beanstalk instances
+    Value: !Ref apiSecurityGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-APISecurityGroup"

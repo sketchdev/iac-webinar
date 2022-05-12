@@ -1,0 +1,407 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Template to create a web deployment consisting of CloudFront hosting S3 content.
+
+Parameters:
+  StageId:
+    Description: Environment Designation (development, staging, production, etc.)
+    Type: String
+    Default: Development
+
+  StageIdLowercase:
+    Description: Environment Designation (development, staging, production, etc.)
+    Type: String
+    Default: development
+
+  Client:
+    Description: Name of the client the stack is being created for
+    Type: String
+
+  PlatformName:
+    Description: DNS-compliant name for the Platform
+    Type: String
+
+  PlatformWebDomain:
+    Description: DNS-compliant domain name for the Platform UI
+    Type: String
+
+  SourceBucket:
+    Description: Specify a bucket to copy SPA files from for this new environment
+    Type: String
+    Default: ""
+
+  SourceStage:
+    Description: Specify a source stage if you want to copy files from this stages bucket
+    Type: String
+    Default: ""
+
+  HostedZoneId:
+    Description: Route53 hosted zone id for the domain hosting the ACM certificate
+    Type: AWS::Route53::HostedZone::Id
+
+
+Conditions:
+  HasSourceBucket:
+    !Not [ !Equals ["", !Ref SourceBucket] ]
+
+
+Resources:
+
+  uiBucket:
+    DependsOn:
+      - cloudFrontOAI
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: TRUE
+        BlockPublicPolicy: TRUE
+        IgnorePublicAcls: TRUE
+        RestrictPublicBuckets: TRUE
+      Tags:
+        - Key: Billing
+          Value:
+            !Ref Client
+        - Key: Client
+          Value:
+            !Ref Client
+        - Key: Purpose
+          Value: Web-hosting
+        - Key: Environment
+          Value:
+            !Ref StageId
+
+  uiBucketPolicy:
+    DependsOn:
+      - cloudFrontOAI
+      - uiBucket
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket:
+        !Ref uiBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - s3:GetObject
+            Resource:
+              Fn::Join: [ "", [ !GetAtt uiBucket.Arn, "/*" ] ]
+            Principal:
+              CanonicalUser: !GetAtt cloudFrontOAI.S3CanonicalUserId
+
+  uiSSLCertificate:
+    Type: AWS::CertificateManager::Certificate
+    Properties:
+      DomainName:
+        Fn::Join: [ ".", [ !Ref StageIdLowercase, !Ref PlatformWebDomain ] ]
+      DomainValidationOptions:
+        - DomainName:
+            Fn::Join: [ ".", [ !Ref StageIdLowercase, !Ref PlatformWebDomain ] ]
+          HostedZoneId:
+            !Ref HostedZoneId
+      ValidationMethod: DNS
+      Tags:
+        - Key: Name
+          Value:
+            !Sub "${StageId} website certificate"
+        - Key: Billing
+          Value:
+            !Ref Client
+        - Key: Client
+          Value:
+            !Ref Client
+        - Key: Purpose
+          Value: Security
+        - Key: Environment
+          Value:
+            !Ref StageId
+
+  cloudFrontOAI:
+    Type: AWS::CloudFront::CloudFrontOriginAccessIdentity
+    Properties:
+      CloudFrontOriginAccessIdentityConfig:
+        Comment:
+          !Sub "Origin Access Identity for the ${StageId} ${PlatformName} bucket"
+
+  # Set up CloudFront Distribution for faster and secured delivery of the UI content to end-users' browsers
+  cloudFrontDistro:
+    DependsOn:
+      - cloudFrontOAI
+      - uiBucket
+      - uiSSLCertificate
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Aliases:
+          - Fn::Join: [ ".", [ !Ref StageIdLowercase, !Ref PlatformWebDomain ] ]
+        Comment:
+          !Sub "Web distro for ${StageId} ${PlatformName}"
+        CustomErrorResponses:
+          - ErrorCachingMinTTL: 300
+            ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+          - ErrorCachingMinTTL: 300
+            ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+        DefaultCacheBehavior:
+          AllowedMethods:
+            - HEAD
+            - GET
+          CachedMethods:
+            - HEAD
+            - GET
+          Compress: true
+          ForwardedValues:
+            Cookies:
+              Forward: none
+            QueryString: false
+          ResponseHeadersPolicyId: "67f7725c-6f97-4210-82d7-5512b31e9d03"
+          TargetOriginId:
+            !Sub "S3-${uiBucket}"
+          ViewerProtocolPolicy: redirect-to-https
+        DefaultRootObject: index.html
+        Enabled: true
+        HttpVersion: http2
+        IPV6Enabled: false
+        Origins:
+          - DomainName:
+              !GetAtt uiBucket.RegionalDomainName
+            Id:
+              !Sub "S3-${uiBucket}"
+            OriginPath: ''
+            S3OriginConfig:
+              OriginAccessIdentity:
+                !Sub "origin-access-identity/cloudfront/${cloudFrontOAI}"
+        PriceClass: PriceClass_100
+        ViewerCertificate:
+          AcmCertificateArn:
+            !Ref uiSSLCertificate
+          MinimumProtocolVersion: TLSv1.2_2021
+          SslSupportMethod: sni-only
+      Tags:
+        - Key: Billing
+          Value:
+            !Ref Client
+        - Key: Client
+          Value:
+            !Ref Client
+        - Key: Purpose
+          Value: Web-hosting
+        - Key: Environment
+          Value:
+            !Ref StageId
+
+  # Create an Aliased DNS entry in Route53 pointing to the CloudFront distribution for web hosting
+  distroDnsEntry:
+    DependsOn:
+      - cloudFrontDistro
+    Type: AWS::Route53::RecordSet
+    Properties:
+      Name:
+        Fn::Join: [ ".", [ !Ref StageIdLowercase, !Ref PlatformWebDomain ] ]
+      AliasTarget:
+        DNSName:
+          !GetAtt cloudFrontDistro.DomainName
+        HostedZoneId: Z2FDTNDATAQYW2
+      Comment:
+        !Sub "DNS alias to web distro for ${StageId} ${PlatformName}"
+      HostedZoneId:
+        !Ref HostedZoneId
+      Type: A
+
+
+  ##
+  ## Custom Resource Definition to copy files from another S3 bucket (if specified in the input params)
+  ##
+
+  # Define custom resource
+  S3CustomResource:
+    Condition: HasSourceBucket
+    Type: Custom::S3CustomResource
+    Properties:
+      ServiceToken: !GetAtt CopyBucketFunction.Arn
+      source_bucket: !Ref SourceBucket
+      destination_bucket: !Ref uiBucket
+      source_stage: !Ref SourceStage
+      destination_stage: !Ref StageIdLowercase
+      platform_domain: !Ref PlatformWebDomain
+
+  # Define lambda function to act as the custom CloudFormation task
+  CopyBucketFunction:
+    Condition: HasSourceBucket
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: "Copy contents of an S3 bucket containing SPA code to init the UI bucket for this environment."
+      FunctionName: !Sub '${AWS::StackName}-${AWS::Region}-copy-bucket'
+      Handler: index.handler
+      Role: !GetAtt AWSLambdaCustResourceExecutionRole.Arn
+      Timeout: 360
+      Runtime: python3.6
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          import re
+          import tempfile
+          def handler(event, context):
+              # Init ...
+              the_event = event['RequestType']
+              print("The event is: ", str(the_event))
+              response_data = {}
+              b_operator = boto3.resource('s3')
+
+              # Retrieve parameters
+              source_bucket_name = event['ResourceProperties']['source_bucket']
+              destination_bucket_name = event['ResourceProperties']['destination_bucket']
+              source_stage = event['ResourceProperties']['source_stage']
+              destination_stage = event['ResourceProperties']['destination_stage']
+              platform_domain = event['ResourceProperties']['platform_domain']
+
+              try:
+                  if the_event in ('Create', 'Update'):
+                      print("Copying files from bucket {} to {}".format(source_bucket_name, destination_bucket_name))
+                      source_bucket = b_operator.Bucket(str(source_bucket_name))
+                      destination_bucket = b_operator.Bucket(str(destination_bucket_name))
+
+                      for file in source_bucket.objects.all():
+                          if re.match(r".*main\..*?\.chunk\.js$", file.key):
+                              print("Found and modifying: ", file.key)
+
+                              with tempfile.TemporaryFile() as f:
+                                  b_operator.meta.client.download_fileobj(source_bucket_name,
+                                                            file.key,
+                                                            f)
+                                  f.seek(0)
+                                  filedata = f.read().decode("utf-8")
+
+                              # Replace the target string
+                              filedata = filedata.replace('http://' + source_stage + '-api.' + platform_domain, 'https://' + destination_stage + '-api.' + platform_domain)
+
+                              # Upload to destination S3
+                              print("Uploading modified: ", file.key)
+                              destination_bucket.put_object(Key=file.key, Body=filedata.encode("utf-8"), ContentType="application/javascript", CacheControl="max-age=300")
+                              continue
+
+                          print("Copying: ", file.key)
+                          copy_source = {
+                            'Bucket': str(source_bucket_name),
+                            'Key': file.key
+                          }
+                          destination_bucket.copy(copy_source, file.key)
+                  elif the_event == 'Delete':
+                      print("Deleting S3 content from {}...".format(destination_bucket_name))
+                      b_operator.Bucket(str(destination_bucket_name)).objects.all().delete()
+                  # Everything OK... send the signal back
+                  print("Operation successful!")
+                  cfnresponse.send(event,
+                                   context,
+                                   cfnresponse.SUCCESS,
+                                   response_data)
+              except Exception as e:
+                  print("Operation failed...")
+                  print(str(e))
+                  response_data['Data'] = str(e)
+                  cfnresponse.send(event,
+                                   context,
+                                   cfnresponse.FAILED,
+                                   response_data)
+      Tags:
+        - Key: Billing
+          Value:
+            !Ref Client
+        - Key: Client
+          Value:
+            !Ref Client
+        - Key: Purpose
+          Value: Cloudformation Custom Resource
+        - Key: Environment
+          Value:
+            !Ref StageId
+
+  # IAM Role that allows [Custom Resource] Lambda to write logs and read/write to specified S3 buckets
+  AWSLambdaCustResourceExecutionRole:
+    Condition: HasSourceBucket
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+        Version: '2012-10-17'
+      Path: "/"
+      Policies:
+        - PolicyDocument:
+            Statement:
+              - Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Effect: Allow
+                Resource: arn:aws:logs:*:*:*
+            Version: '2012-10-17'
+          PolicyName: !Sub ${AWS::StackName}-${AWS::Region}-AWSLambda-CW
+        - PolicyDocument:
+            Statement:
+              - Action:
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:List*
+                Effect: Allow
+                Resource:
+                  - !Sub arn:aws:s3:::${uiBucket}/*
+                  - !Sub arn:aws:s3:::${uiBucket}
+            Version: '2012-10-17'
+          PolicyName: !Sub ${AWS::StackName}-${AWS::Region}-AWSLambda-S3-Destination
+        - PolicyDocument:
+            Statement:
+              - Action:
+                  - s3:GetObject
+                  - s3:List*
+                Effect: Allow
+                Resource:
+                  - !Sub arn:aws:s3:::${SourceBucket}/*
+                  - !Sub arn:aws:s3:::${SourceBucket}
+            Version: '2012-10-17'
+          PolicyName: !Sub ${AWS::StackName}-${AWS::Region}-AWSLambda-S3-Source
+      # "CRE" = Custom Resource Execution
+      RoleName: !Sub ${AWS::StackName}-${AWS::Region}-CRE
+      Tags:
+        - Key: Billing
+          Value:
+            !Ref Client
+        - Key: Client
+          Value:
+            !Ref Client
+        - Key: Purpose
+          Value: Cloudformation Custom Resource Role
+        - Key: Environment
+          Value:
+            !Ref StageId
+
+
+Outputs:
+  CloudFrontDistroId:
+    Description: Cloudfront Distribution ID
+    Value: !Ref cloudFrontDistro
+    Export:
+      Name: !Sub "${AWS::StackName}-CloudFrontDistroId"
+  AppUrl:
+    Description: URL to access the website at
+    Value: !Sub "https://${distroDnsEntry}"
+    Export:
+      Name: !Sub "${AWS::StackName}-AppUrl"
+  BucketName:
+    Description: Bucket created for the web deployment
+    Value: !Ref uiBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-BucketName"
+  BucketArn:
+    Description: ARN of bucket created for the web deployment
+    Value: !GetAtt uiBucket.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-BucketArn"
